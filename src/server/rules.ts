@@ -128,3 +128,17 @@ export const continuousMultiplayerPace: RacePaceSource = (grandPrix, terminalID,
   const scale = MultiplayerRules.continuousPaceJitterHalfWidth / (RaceRules.paceMax - 1);
   return 1 + (seededPace(grandPrix, terminalID, lap) - 1) * scale;
 };
+
+/** Half-width of the seeded jitter once local classic earns its seat through
+ *  uptime (see classic-pace.ts). The uptime band spans ±0.25 around 1.0, so any
+ *  jitter under 0.25 keeps a fully-working car strictly ahead of a fully-idle
+ *  one: 1.25·(1−j) > 0.75·(1+j) ⟺ j < 0.25. At 0.10 the extremes clear each
+ *  other by a wide margin (1.125 vs 0.825) while the pack still visibly breathes. */
+export const classicEarnedPaceJitterHalfWidth = 0.1;
+
+/** Classic local pace when the uptime tilt is active: the same seeded dice,
+ *  squeezed so decoration no longer obscures the earned order. */
+export const classicEarnedPace: RacePaceSource = (grandPrix, terminalID, lap) => {
+  const scale = classicEarnedPaceJitterHalfWidth / (RaceRules.paceMax - 1);
+  return 1 + (seededPace(grandPrix, terminalID, lap) - 1) * scale;
+};
