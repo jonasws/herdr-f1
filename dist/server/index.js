@@ -5271,6 +5271,60 @@ onGrandPrixStart) {
     return { start, stop, addClient, removeClient, tick, buildSync };
 }
 
+;// CONCATENATED MODULE: ./src/server/herdr/types.ts
+function allAgents(snapshot) {
+    return snapshot.teams.flatMap(team => team.agents);
+}
+
+;// CONCATENATED MODULE: ./src/server/multiplayer/uptime.ts
+/**
+ * Rolling uptime over a sliding window (design decision M4) — the momentum
+ * behind a car's speed. Power is piecewise constant between reports (no herdr
+ * event means no change), so the tracker stores the change points and
+ * integrates exactly; no sampling, no decay approximation.
+ */
+function createUptimeTracker(windowSeconds) {
+    /** Change points, oldest first. Power before the first entry is 0. */
+    let segments = [];
+    /** Records the instantaneous power (0..1) from `now` on. */
+    function setPower(now, power) {
+        const last = segments[segments.length - 1];
+        if (last && last.power === power)
+            return;
+        if (last && last.at >= now) {
+            // Same-instant correction: the latest value wins.
+            last.power = power;
+            return;
+        }
+        segments.push({ at: now, power });
+    }
+    /** Mean power over [now - window, now], in 0..1. */
+    function uptime(now) {
+        const start = now - windowSeconds;
+        prune(start);
+        let integral = 0;
+        for (let index = 0; index < segments.length; index += 1) {
+            const from = Math.max(segments[index].at, start);
+            const to = Math.min(index + 1 < segments.length ? segments[index + 1].at : now, now);
+            if (to > from)
+                integral += segments[index].power * (to - from);
+        }
+        return Math.min(1, Math.max(0, integral / windowSeconds));
+    }
+    /** Drops change points that no longer affect the window, keeping the last
+     *  one at or before `start` as the window's boundary value. */
+    function prune(start) {
+        let firstRelevant = 0;
+        while (firstRelevant + 1 < segments.length &&
+            segments[firstRelevant + 1].at <= start) {
+            firstRelevant += 1;
+        }
+        if (firstRelevant > 0)
+            segments = segments.slice(firstRelevant);
+    }
+    return { setPower, uptime };
+}
+
 ;// CONCATENATED MODULE: ./src/server/rules.ts
 /// Fixed game rules for the fictional Grand Prix. None of these values are
 /// measurements of real work; they exist only to make status fun to watch.
@@ -5393,6 +5447,77 @@ const continuousMultiplayerPace = (grandPrix, terminalID, lap) => {
     const scale = MultiplayerRules.continuousPaceJitterHalfWidth / (RaceRules.paceMax - 1);
     return 1 + (seededPace(grandPrix, terminalID, lap) - 1) * scale;
 };
+/** Half-width of the seeded jitter once local classic earns its seat through
+ *  uptime (see classic-pace.ts). The uptime band spans ±0.25 around 1.0, so any
+ *  jitter under 0.25 keeps a fully-working car strictly ahead of a fully-idle
+ *  one: 1.25·(1−j) > 0.75·(1+j) ⟺ j < 0.25. At 0.10 the extremes clear each
+ *  other by a wide margin (1.125 vs 0.825) while the pack still visibly breathes. */
+const classicEarnedPaceJitterHalfWidth = 0.1;
+/** Classic local pace when the uptime tilt is active: the same seeded dice,
+ *  squeezed so decoration no longer obscures the earned order. */
+const classicEarnedPace = (grandPrix, terminalID, lap) => {
+    const scale = classicEarnedPaceJitterHalfWidth / (RaceRules.paceMax - 1);
+    return 1 + (seededPace(grandPrix, terminalID, lap) - 1) * scale;
+};
+
+;// CONCATENATED MODULE: ./src/server/classic-pace.ts
+
+
+
+/**
+ * Classic-mode earned pace: the same rolling-uptime tilt multiplayer earns
+ * (M4), brought to a single local Herdr session. Each car's externalPace
+ * reflects how much of the last 90 seconds that agent actually spent working,
+ * so position reads as productivity — a stalled agent drifts back, a busy one
+ * pulls ahead. The seeded jitter stays on untouched as decoration; this only
+ * drives externalPace, so the two compose (truthful seat + lively wiggle).
+ *
+ * The band is floored at MultiplayerRules.uptimeFloor, so a car that has done
+ * no work slows but keeps circulating rather than freezing. That is the
+ * graceful-degradation property: an agent whose harness Herdr classifies
+ * coarsely (or briefly mislabels) still races on the floor plus its jitter,
+ * indistinguishable from classic's original decorative motion.
+ */
+function createClassicPaceTracker() {
+    const trackers = new Map();
+    function track(terminalID) {
+        let tracker = trackers.get(terminalID);
+        if (!tracker) {
+            tracker = createUptimeTracker(MultiplayerRules.uptimeWindowSeconds);
+            trackers.set(terminalID, tracker);
+        }
+        return tracker;
+    }
+    /** Records each agent's instantaneous working power from one snapshot. */
+    function observe(snapshot, now) {
+        const present = new Set();
+        for (const agent of allAgents(snapshot)) {
+            if (agent.terminalID === '')
+                continue;
+            present.add(agent.terminalID);
+            track(agent.terminalID).setPower(now, agent.status === 'working' ? 1 : 0);
+        }
+        // An agent that left the snapshot (pane closed, agent exited) stops
+        // earning: its car decays to the floor instead of holding its last speed.
+        for (const [terminalID, tracker] of trackers) {
+            if (!present.has(terminalID))
+                tracker.setPower(now, 0);
+        }
+    }
+    /** The externalPace factor for every tracked car, for the dashboard to inject
+     *  each tick (mirrors the multiplayer host's momentum loop). */
+    function factors(now) {
+        const result = [];
+        for (const [terminalID, tracker] of trackers) {
+            result.push({
+                terminalID,
+                factor: MultiplayerRules.uptimeFloor + MultiplayerRules.uptimeSpan * tracker.uptime(now),
+            });
+        }
+        return result;
+    }
+    return { observe, factors };
+}
 
 ;// CONCATENATED MODULE: ./src/server/fixtures.ts
 
@@ -5615,11 +5740,6 @@ function firstVisible(...values) {
             return trimmed;
     }
     return null;
-}
-
-;// CONCATENATED MODULE: ./src/server/herdr/types.ts
-function allAgents(snapshot) {
-    return snapshot.teams.flatMap(team => team.agents);
 }
 
 ;// CONCATENATED MODULE: ./src/server/herdr/client.ts
@@ -7315,6 +7435,8 @@ function canBind(port, host) {
 
 
 
+
+
 const monotonicSeconds = () => performance.now() / 1000;
 const WILDCARD = new Set(['0.0.0.0', '::']);
 /** Every URL a server on `bindHost` actually answers on. A wildcard bind has
@@ -7343,15 +7465,33 @@ function webRootPath() {
     return external_node_path_default().resolve(external_node_path_default().dirname((0,external_node_url_namespaceObject.fileURLToPath)(import.meta.url)), '../web');
 }
 async function startDashboard(options) {
-    const session = createRaceSession();
+    // Local classic earns its seat through uptime (classic-pace.ts), so the
+    // seeded dice narrow to flavour that no longer obscures the order.
+    const session = createRaceSession(classicEarnedPace);
     const broadcaster = createRaceBroadcaster(session, monotonicSeconds);
+    const pace = createClassicPaceTracker();
     let client = null;
+    let paceTimer = null;
     if (options.target.kind === 'fixture') {
         loadFixture(options.target.name, session);
     }
     else {
         client = createHerdrClient({ socketPath: options.target.socketPath });
-        client.start(update => session.apply(update, monotonicSeconds()));
+        client.start(update => {
+            const now = monotonicSeconds();
+            if (update.kind === 'snapshot')
+                pace.observe(update.snapshot, now);
+            session.apply(update, now);
+        });
+        // The momentum loop (M4), brought to local classic: rolling uptime keeps
+        // changing with time alone, so earned car speeds refresh on a cadence, not
+        // only when a status flips. Mirrors the multiplayer host's pace timer.
+        paceTimer = setInterval(() => {
+            const now = monotonicSeconds();
+            for (const { terminalID, factor } of pace.factors(now)) {
+                session.setExternalPace(terminalID, factor, now);
+            }
+        }, 250);
     }
     const webRoot = webRootPath();
     const bindHost = options.bindHost ?? '127.0.0.1';
@@ -7376,6 +7516,8 @@ async function startDashboard(options) {
         bindHost,
         port: server.port,
         close: async () => {
+            if (paceTimer)
+                clearInterval(paceTimer);
             broadcaster.stop();
             client?.stop();
             await server.close();
@@ -7607,55 +7749,6 @@ function isVenueID(id) {
 }
 function venueLaps(id) {
     return VENUES.find(venue => venue.id === id).laps;
-}
-
-;// CONCATENATED MODULE: ./src/server/multiplayer/uptime.ts
-/**
- * Rolling uptime over a sliding window (design decision M4) — the momentum
- * behind a car's speed. Power is piecewise constant between reports (no herdr
- * event means no change), so the tracker stores the change points and
- * integrates exactly; no sampling, no decay approximation.
- */
-function createUptimeTracker(windowSeconds) {
-    /** Change points, oldest first. Power before the first entry is 0. */
-    let segments = [];
-    /** Records the instantaneous power (0..1) from `now` on. */
-    function setPower(now, power) {
-        const last = segments[segments.length - 1];
-        if (last && last.power === power)
-            return;
-        if (last && last.at >= now) {
-            // Same-instant correction: the latest value wins.
-            last.power = power;
-            return;
-        }
-        segments.push({ at: now, power });
-    }
-    /** Mean power over [now - window, now], in 0..1. */
-    function uptime(now) {
-        const start = now - windowSeconds;
-        prune(start);
-        let integral = 0;
-        for (let index = 0; index < segments.length; index += 1) {
-            const from = Math.max(segments[index].at, start);
-            const to = Math.min(index + 1 < segments.length ? segments[index + 1].at : now, now);
-            if (to > from)
-                integral += segments[index].power * (to - from);
-        }
-        return Math.min(1, Math.max(0, integral / windowSeconds));
-    }
-    /** Drops change points that no longer affect the window, keeping the last
-     *  one at or before `start` as the window's boundary value. */
-    function prune(start) {
-        let firstRelevant = 0;
-        while (firstRelevant + 1 < segments.length &&
-            segments[firstRelevant + 1].at <= start) {
-            firstRelevant += 1;
-        }
-        if (firstRelevant > 0)
-            segments = segments.slice(firstRelevant);
-    }
-    return { setPower, uptime };
 }
 
 ;// CONCATENATED MODULE: ./src/server/multiplayer/wire.ts

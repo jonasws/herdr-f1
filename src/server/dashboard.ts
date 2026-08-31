@@ -2,9 +2,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRaceBroadcaster } from './broadcaster.js';
+import { createClassicPaceTracker } from './classic-pace.js';
 import { loadFixture } from './fixtures.js';
 import { createHerdrClient, type HerdrClient } from './herdr/client.js';
 import { createRaceSession } from './race-session.js';
+import { classicEarnedPace } from './rules.js';
 import { startServer } from './server.js';
 import type { InstanceTarget } from './target.js';
 
@@ -45,14 +47,31 @@ export async function startDashboard(options: {
    *  to anything that can route to this host. */
   bindHost?: string;
 }) {
-  const session = createRaceSession();
+  // Local classic earns its seat through uptime (classic-pace.ts), so the
+  // seeded dice narrow to flavour that no longer obscures the order.
+  const session = createRaceSession(classicEarnedPace);
   const broadcaster = createRaceBroadcaster(session, monotonicSeconds);
+  const pace = createClassicPaceTracker();
   let client: HerdrClient | null = null;
+  let paceTimer: ReturnType<typeof setInterval> | null = null;
   if (options.target.kind === 'fixture') {
     loadFixture(options.target.name, session);
   } else {
     client = createHerdrClient({ socketPath: options.target.socketPath });
-    client.start(update => session.apply(update, monotonicSeconds()));
+    client.start(update => {
+      const now = monotonicSeconds();
+      if (update.kind === 'snapshot') pace.observe(update.snapshot, now);
+      session.apply(update, now);
+    });
+    // The momentum loop (M4), brought to local classic: rolling uptime keeps
+    // changing with time alone, so earned car speeds refresh on a cadence, not
+    // only when a status flips. Mirrors the multiplayer host's pace timer.
+    paceTimer = setInterval(() => {
+      const now = monotonicSeconds();
+      for (const { terminalID, factor } of pace.factors(now)) {
+        session.setExternalPace(terminalID, factor, now);
+      }
+    }, 250);
   }
   const webRoot = webRootPath();
   const bindHost = options.bindHost ?? '127.0.0.1';
@@ -77,6 +96,7 @@ export async function startDashboard(options: {
     bindHost,
     port: server.port,
     close: async () => {
+      if (paceTimer) clearInterval(paceTimer);
       broadcaster.stop();
       client?.stop();
       await server.close();

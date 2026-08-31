@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { RaceRules, seededPace, stableHash } from '../src/server/rules.js';
+import {
+  classicEarnedPace, classicEarnedPaceJitterHalfWidth,
+  MultiplayerRules, RaceRules, seededPace, stableHash,
+} from '../src/server/rules.js';
 import { palette } from '../src/web/palette.js';
 
 describe('RaceRules', () => {
@@ -55,5 +58,24 @@ describe('seededPace', () => {
     const paces = new Set(Array.from({ length: 10 }, (_, lap) => seededPace(1, 't1', lap)));
     expect(paces.size).toBeGreaterThan(1);
     expect(seededPace(1, 't1', 3)).not.toBe(seededPace(2, 't1', 3));
+  });
+});
+
+describe('classicEarnedPace', () => {
+  it('narrows the seeded jitter to the earned half-width', () => {
+    for (let lap = 0; lap < 58; lap += 1) {
+      const pace = classicEarnedPace(1, 't1', lap);
+      expect(pace).toBeGreaterThanOrEqual(1 - classicEarnedPaceJitterHalfWidth - 1e-9);
+      expect(pace).toBeLessThanOrEqual(1 + classicEarnedPaceJitterHalfWidth + 1e-9);
+    }
+  });
+
+  it('stays inside the uptime band so working always out-seats idle', () => {
+    // A fully-working car (externalPace uptimeFloor+uptimeSpan) at its jitter
+    // minimum must still beat a fully-idle car (uptimeFloor) at its maximum.
+    const { uptimeFloor, uptimeSpan } = MultiplayerRules;
+    const workingFloor = (uptimeFloor + uptimeSpan) * (1 - classicEarnedPaceJitterHalfWidth);
+    const idleCeiling = uptimeFloor * (1 + classicEarnedPaceJitterHalfWidth);
+    expect(workingFloor).toBeGreaterThan(idleCeiling);
   });
 });
